@@ -31,6 +31,10 @@ EMAIL_CATEGORY_INSTRUCTIONS = (
     "也分别和Project A、Project B、Project C分为同一类。其他没cover的邮件，分类为其他"
 )
 
+EMAIL_SUMMARY_INSTRUCTIONS = (
+    "这是一个邮件，根据邮件内容提炼一句话的摘要，并注明是否有附件。"
+)   
+
 
 def parse_date(value: str) -> date:
     try:
@@ -248,6 +252,67 @@ def default_categorized_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_categorized.json")
 
 
+SUMMARY_BODY_MAX_CHARS = 4000
+
+
+def build_summary_prompt(email: dict) -> str:
+    body = email.get("body_text") or email.get("snippet") or ""
+    if len(body) > SUMMARY_BODY_MAX_CHARS:
+        body = body[:SUMMARY_BODY_MAX_CHARS] + "…"
+    return (
+        f"{EMAIL_SUMMARY_INSTRUCTIONS}\n\n"
+        f"当前邮件：\n"
+        f"- id: {email.get('id')}\n"
+        f"- subject: {email.get('subject')}\n"
+        f"- from: {email.get('from')}\n"
+        f"- date: {email.get('date')}\n"
+        f"- body:\n{body}\n\n"
+        f"请只返回一句话摘要（含是否有附件），不要返回其他内容。"
+    )
+
+
+def parse_summary(raw: str) -> str:
+    return raw.strip().strip("\"'")
+
+
+def default_summarized_output_path(input_path: Path) -> Path:
+    return input_path.with_name(f"{input_path.stem}_summarized.json")
+
+
+def default_processed_output_path(input_path: Path) -> Path:
+    return input_path.with_name(f"{input_path.stem}_processed.json")
+
+
+def summarize_emails_from_json(
+    input_path: Path,
+    output_path: Path | None = None,
+    model_name: str = DOUBAO_LITE_MODEL,
+) -> dict:
+    load_dotenv()
+    data = load_emails_json(input_path)
+    emails = data["emails"]
+    total = len(emails)
+
+    for index, email in enumerate(emails, start=1):
+        prompt = build_summary_prompt(email)
+        raw_summary = get_doubao_response(model_name, prompt)
+        email["summary"] = parse_summary(raw_summary)
+        subject = email.get("subject") or "(no subject)"
+        print(f"Summarized {index}/{total}: {subject}")
+
+    result = {
+        **data,
+        "summarized_at": datetime.now(timezone.utc).isoformat(),
+        "model": model_name,
+        "emails": emails,
+    }
+
+    out_path = output_path or default_summarized_output_path(input_path)
+    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    print(f"Saved summarized emails to {out_path}")
+    return result
+
+
 def categorize_emails_from_json(
     input_path: Path,
     output_path: Path | None = None,
@@ -280,6 +345,46 @@ def categorize_emails_from_json(
     out_path = output_path or default_categorized_output_path(input_path)
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"Saved categorized emails to {out_path}")
+    return result
+
+
+def process_emails_from_json(
+    input_path: Path,
+    output_path: Path | None = None,
+    model_name: str = DOUBAO_LITE_MODEL,
+) -> dict:
+    load_dotenv()
+    data = load_emails_json(input_path)
+    emails = data["emails"]
+    all_subjects = [
+        subject for email in emails if (subject := email.get("subject"))
+    ]
+    total = len(emails)
+
+    for index, email in enumerate(emails, start=1):
+        category_prompt = build_category_prompt(email, all_subjects)
+        raw_category = get_doubao_response(model_name, category_prompt)
+        email["category"] = parse_category(raw_category)
+
+        summary_prompt = build_summary_prompt(email)
+        raw_summary = get_doubao_response(model_name, summary_prompt)
+        email["summary"] = parse_summary(raw_summary)
+
+        subject = email.get("subject") or "(no subject)"
+        print(
+            f"Processed {index}/{total}: {email['category']} - {subject}"
+        )
+
+    result = {
+        **data,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+        "model": model_name,
+        "emails": emails,
+    }
+
+    out_path = output_path or default_processed_output_path(input_path)
+    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    print(f"Saved processed emails to {out_path}")
     return result
 
 
@@ -321,11 +426,30 @@ def run_categorize(args: argparse.Namespace) -> None:
     )
 
 
+def run_summarize(args: argparse.Namespace) -> None:
+    summarize_emails_from_json(
+        input_path=args.input,
+        output_path=args.output,
+        model_name=args.model,
+    )
+
+
+def run_process(args: argparse.Namespace) -> None:
+    process_emails_from_json(
+        input_path=args.input,
+        output_path=args.output,
+        model_name=args.model,
+    )
+
+
 def main() -> None:
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="Fetch Gmail messages or categorize saved email JSON."
+        description=(
+            "Fetch Gmail messages, or categorize, summarize, "
+            "or process saved email JSON."
+        )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -376,12 +500,58 @@ def main() -> None:
     )
     categorize_parser.set_defaults(func=run_categorize)
 
+    summarize_parser = subparsers.add_parser(
+        "summarize", help="Summarize emails in a saved JSON file with Doubao."
+    )
+    summarize_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Input email JSON file path.",
+    )
+    summarize_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output JSON file path (default: <input>_summarized.json).",
+    )
+    summarize_parser.add_argument(
+        "--model",
+        default=DOUBAO_LITE_MODEL,
+        help=f"Doubao model name (default: {DOUBAO_LITE_MODEL}).",
+    )
+    summarize_parser.set_defaults(func=run_summarize)
+
+    process_parser = subparsers.add_parser(
+        "process",
+        help=(
+            "Categorize and summarize emails in a saved JSON file "
+            "with Doubao."
+        ),
+    )
+    process_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Input email JSON file path.",
+    )
+    process_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output JSON file path (default: <input>_processed.json).",
+    )
+    process_parser.add_argument(
+        "--model",
+        default=DOUBAO_LITE_MODEL,
+        help=f"Doubao model name (default: {DOUBAO_LITE_MODEL}).",
+    )
+    process_parser.set_defaults(func=run_process)
+
     args = parser.parse_args()
     args.func(args)
 
 
 
 # python3 fetch_gmail.py fetch --start-date 2026-06-06 --end-date 2026-06-07
-# python3 fetch_gmail.py categorize --input emails_2026-06-06_2026-06-07.json
+# python3 fetch_gmail.py process --input emails_2026-06-06_2026-06-07.json
 if __name__ == "__main__":
     main()
