@@ -728,5 +728,6 @@ def main() -> None:
 # python3 fetch_gmail.py fetch --start-date 2026-06-06 --end-date 2026-06-07
 # python3 fetch_gmail.py process --input emails_2026-06-06_2026-06-07.json
 # python3 fetch_gmail.py todo --input emails_2026-06-06_2026-06-07_processed.json
+# python3 time_tracker.py emails_2026-06-06_2026-06-07_todo.json
 if __name__ == "__main__":
     main()
