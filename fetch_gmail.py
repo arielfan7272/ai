@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import os
+import socket
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -16,6 +17,22 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+
+def _prefer_ipv4_for_google_api() -> None:
+    """Prefer IPv4; httplib2 does not fall back when IPv6 routes are broken."""
+    original_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo_ipv4_first(
+        host, port, family=0, type=0, proto=0, flags=0
+    ):
+        results = original_getaddrinfo(host, port, family, type, proto, flags)
+        return sorted(results, key=lambda item: item[0] != socket.AF_INET)
+
+    socket.getaddrinfo = getaddrinfo_ipv4_first
+
+
+_prefer_ipv4_for_google_api()
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
@@ -33,7 +50,9 @@ EMAIL_CATEGORY_INSTRUCTIONS = (
 
 EMAIL_SUMMARY_INSTRUCTIONS = (
     "这是一个邮件，根据邮件内容提炼一句话的摘要，并注明是否有附件。"
-)   
+)
+
+TODO_LIST_GENERATOR_PROMPT = "根据邮件内容生成一个 to do list，这个 to do list 包含项目名称，需要处理的事项。其中，名称和需要处理的事项根据邮件内容整理。"
 
 
 def parse_date(value: str) -> date:
