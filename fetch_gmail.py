@@ -54,8 +54,8 @@ EMAIL_SUMMARY_INSTRUCTIONS = (
 
 TODO_LIST_GENERATOR_PROMPT = (
     "根据邮件内容生成一个 to do list，按项目名称分组，列出需要处理的事项。"
-    "只输出纯文本，使用 Markdown 格式：每个项目用 ## 项目名称 作为标题，"
-    "每个事项用 - [ ] 开头。不要输出其他解释性文字。"
+    "只输出 JSON，不要输出其他解释性文字。格式如下：\n"
+    '{"projects": [{"name": "项目名称", "items": [{"text": "需要处理的事项", "done": false}]}]}'
 )
 
 EXCLUDED_TODO_CATEGORIES = {"其他"}
@@ -277,13 +277,18 @@ def default_categorized_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_categorized.json")
 
 
-SUMMARY_BODY_MAX_CHARS = 4000
+EMAIL_BODY_MAX_CHARS = 4000
+
+
+def get_email_body(email: dict, max_chars: int = EMAIL_BODY_MAX_CHARS) -> str:
+    body = email.get("body_text") or email.get("snippet") or ""
+    if len(body) > max_chars:
+        body = body[:max_chars] + "…"
+    return body
 
 
 def build_summary_prompt(email: dict) -> str:
-    body = email.get("body_text") or email.get("snippet") or ""
-    if len(body) > SUMMARY_BODY_MAX_CHARS:
-        body = body[:SUMMARY_BODY_MAX_CHARS] + "…"
+    body = get_email_body(email)
     return (
         f"{EMAIL_SUMMARY_INSTRUCTIONS}\n\n"
         f"当前邮件：\n"
@@ -310,7 +315,22 @@ def default_processed_output_path(input_path: Path) -> Path:
 
 def default_todo_output_path(input_path: Path) -> Path:
     stem = input_path.stem.removesuffix("_processed")
-    return input_path.with_name(f"{stem}_todo.txt")
+    return input_path.with_name(f"{stem}_todo.json")
+
+
+def parse_todo_response(raw: str) -> dict:
+    text = raw.strip().strip("\"'")
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    data = json.loads(text)
+    if "projects" not in data:
+        raise ValueError("Todo response must contain a 'projects' key.")
+    return data
 
 
 def build_todo_prompt(emails: list[dict]) -> str:
@@ -319,8 +339,9 @@ def build_todo_prompt(emails: list[dict]) -> str:
         lines.append(
             f"{index}. 项目: {email.get('category')}\n"
             f"   主题: {email.get('subject')}\n"
-            f"   摘要: {email.get('summary')}\n"
-            f"   日期: {email.get('date')}"
+            f"   发件人: {email.get('from')}\n"
+            f"   日期: {email.get('date')}\n"
+            f"   正文:\n{get_email_body(email)}"
         )
     email_block = "\n\n".join(lines)
     return f"{TODO_LIST_GENERATOR_PROMPT}\n\n邮件列表：\n{email_block}"
@@ -330,20 +351,31 @@ def generate_todo_from_json(
     input_path: Path,
     output_path: Path | None = None,
     model_name: str = DOUBAO_PRO_MODEL,
-) -> str:
+) -> dict:
     load_dotenv()
     data = load_emails_json(input_path)
     emails = data["emails"]
 
-    missing_fields = [
+    missing_category = [
         email.get("id") or "(unknown id)"
         for email in emails
-        if "category" not in email or "summary" not in email
+        if "category" not in email
     ]
-    if missing_fields:
+    if missing_category:
         raise ValueError(
-            f"Input must be processed JSON with category and summary. "
-            f"Missing fields for email ids: {', '.join(missing_fields)}"
+            f"Input must be processed JSON with category. "
+            f"Missing category for email ids: {', '.join(missing_category)}"
+        )
+
+    missing_body = [
+        email.get("id") or "(unknown id)"
+        for email in emails
+        if not (email.get("body_text") or email.get("snippet"))
+    ]
+    if missing_body:
+        raise ValueError(
+            f"Input must include original email body (body_text or snippet). "
+            f"Missing body for email ids: {', '.join(missing_body)}"
         )
 
     actionable = [
@@ -357,16 +389,39 @@ def generate_todo_from_json(
 
     if not actionable:
         print("No actionable emails to include in todo list.")
-        return ""
+        result = {
+            "source": str(input_path),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "model": model_name,
+            "projects": [],
+        }
+        out_path = output_path or default_todo_output_path(input_path)
+        out_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Saved todo list to {out_path}")
+        return result
 
     print(f"Generating todo list from {len(actionable)} email(s)...")
     prompt = build_todo_prompt(actionable)
-    todo_text = get_doubao_response(model_name, prompt).strip()
+    raw_todo = get_doubao_response(model_name, prompt)
+    todo_data = parse_todo_response(raw_todo)
+
+    result = {
+        "source": str(input_path),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": model_name,
+        **todo_data,
+    }
 
     out_path = output_path or default_todo_output_path(input_path)
-    out_path.write_text(todo_text + "\n", encoding="utf-8")
+    out_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     print(f"Saved todo list to {out_path}")
-    return todo_text
+    return result
 
 
 def summarize_emails_from_json(
@@ -643,7 +698,7 @@ def main() -> None:
     todo_parser = subparsers.add_parser(
         "todo",
         help=(
-            "Generate an editable text todo list from processed email JSON "
+            "Generate an editable JSON todo list from processed email JSON "
             "with Doubao."
         ),
     )
@@ -656,7 +711,7 @@ def main() -> None:
     todo_parser.add_argument(
         "--output",
         type=Path,
-        help="Output text file path (default: <input>_todo.txt).",
+        help="Output JSON file path (default: <input>_todo.json).",
     )
     todo_parser.add_argument(
         "--model",
