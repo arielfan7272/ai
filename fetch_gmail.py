@@ -52,7 +52,13 @@ EMAIL_SUMMARY_INSTRUCTIONS = (
     "这是一个邮件，根据邮件内容提炼一句话的摘要，并注明是否有附件。"
 )
 
-TODO_LIST_GENERATOR_PROMPT = "根据邮件内容生成一个 to do list，这个 to do list 包含项目名称，需要处理的事项。其中，名称和需要处理的事项根据邮件内容整理。"
+TODO_LIST_GENERATOR_PROMPT = (
+    "根据邮件内容生成一个 to do list，按项目名称分组，列出需要处理的事项。"
+    "只输出纯文本，使用 Markdown 格式：每个项目用 ## 项目名称 作为标题，"
+    "每个事项用 - [ ] 开头。不要输出其他解释性文字。"
+)
+
+EXCLUDED_TODO_CATEGORIES = {"其他"}
 
 
 def parse_date(value: str) -> date:
@@ -302,6 +308,67 @@ def default_processed_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_processed.json")
 
 
+def default_todo_output_path(input_path: Path) -> Path:
+    stem = input_path.stem.removesuffix("_processed")
+    return input_path.with_name(f"{stem}_todo.txt")
+
+
+def build_todo_prompt(emails: list[dict]) -> str:
+    lines = []
+    for index, email in enumerate(emails, start=1):
+        lines.append(
+            f"{index}. 项目: {email.get('category')}\n"
+            f"   主题: {email.get('subject')}\n"
+            f"   摘要: {email.get('summary')}\n"
+            f"   日期: {email.get('date')}"
+        )
+    email_block = "\n\n".join(lines)
+    return f"{TODO_LIST_GENERATOR_PROMPT}\n\n邮件列表：\n{email_block}"
+
+
+def generate_todo_from_json(
+    input_path: Path,
+    output_path: Path | None = None,
+    model_name: str = DOUBAO_PRO_MODEL,
+) -> str:
+    load_dotenv()
+    data = load_emails_json(input_path)
+    emails = data["emails"]
+
+    missing_fields = [
+        email.get("id") or "(unknown id)"
+        for email in emails
+        if "category" not in email or "summary" not in email
+    ]
+    if missing_fields:
+        raise ValueError(
+            f"Input must be processed JSON with category and summary. "
+            f"Missing fields for email ids: {', '.join(missing_fields)}"
+        )
+
+    actionable = [
+        email
+        for email in emails
+        if email.get("category") not in EXCLUDED_TODO_CATEGORIES
+    ]
+    skipped = len(emails) - len(actionable)
+    if skipped:
+        print(f"Skipped {skipped} email(s) in category 其他")
+
+    if not actionable:
+        print("No actionable emails to include in todo list.")
+        return ""
+
+    print(f"Generating todo list from {len(actionable)} email(s)...")
+    prompt = build_todo_prompt(actionable)
+    todo_text = get_doubao_response(model_name, prompt).strip()
+
+    out_path = output_path or default_todo_output_path(input_path)
+    out_path.write_text(todo_text + "\n", encoding="utf-8")
+    print(f"Saved todo list to {out_path}")
+    return todo_text
+
+
 def summarize_emails_from_json(
     input_path: Path,
     output_path: Path | None = None,
@@ -461,13 +528,21 @@ def run_process(args: argparse.Namespace) -> None:
     )
 
 
+def run_todo(args: argparse.Namespace) -> None:
+    generate_todo_from_json(
+        input_path=args.input,
+        output_path=args.output,
+        model_name=args.model,
+    )
+
+
 def main() -> None:
     load_dotenv()
 
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch Gmail messages, or categorize, summarize, "
-            "or process saved email JSON."
+            "Fetch Gmail messages, or categorize, summarize, process, "
+            "or generate a todo list from saved email JSON."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -565,6 +640,31 @@ def main() -> None:
     )
     process_parser.set_defaults(func=run_process)
 
+    todo_parser = subparsers.add_parser(
+        "todo",
+        help=(
+            "Generate an editable text todo list from processed email JSON "
+            "with Doubao."
+        ),
+    )
+    todo_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Input processed email JSON file path.",
+    )
+    todo_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output text file path (default: <input>_todo.txt).",
+    )
+    todo_parser.add_argument(
+        "--model",
+        default=DOUBAO_PRO_MODEL,
+        help=f"Doubao model name (default: {DOUBAO_PRO_MODEL}).",
+    )
+    todo_parser.set_defaults(func=run_todo)
+
     args = parser.parse_args()
     args.func(args)
 
@@ -572,5 +672,6 @@ def main() -> None:
 
 # python3 fetch_gmail.py fetch --start-date 2026-06-06 --end-date 2026-06-07
 # python3 fetch_gmail.py process --input emails_2026-06-06_2026-06-07.json
+# python3 fetch_gmail.py todo --input emails_2026-06-06_2026-06-07_processed.json
 if __name__ == "__main__":
     main()
