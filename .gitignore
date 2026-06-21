@@ -5,3 +5,4 @@ token.json
 __pycache__/
 .venv/
 emails.json
+.time_logs/
