@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import copy
 import json
 import os
@@ -12,7 +13,7 @@ import tkinter.messagebox as messagebox
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import customtkinter as ctk
 
@@ -45,6 +46,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "back": "Back",
         "no_description": "No description provided.",
         "time_used": "time used: {hours}",
+        "time_used_label": "time used:",
+        "time_hours_unit": "h",
         "edit": "Edit",
         "delete": "Delete",
         "add_project": "+ Add project",
@@ -71,6 +74,22 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
         "unsaved_title": "Unsaved changes",
         "unsaved_message": "Save changes to the todo list before closing?",
+        "home_title": "Time Tracker",
+        "lets_roll": "Let's roll!",
+        "time_log_history": "Time log history",
+        "calendar_title": "Calendar",
+        "home": "Home",
+        "prev_month": "◀",
+        "next_month": "▶",
+        "weekday_0": "Mon",
+        "weekday_1": "Tue",
+        "weekday_2": "Wed",
+        "weekday_3": "Thu",
+        "weekday_4": "Fri",
+        "weekday_5": "Sat",
+        "weekday_6": "Sun",
+        "no_time_logged": "No time logged for this date.",
+        "history_summary_title": "Work history for {date}",
     },
     "cn": {
         "window_title": "工时记录 — {date}",
@@ -86,6 +105,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "back": "返回",
         "no_description": "暂无工作描述。",
         "time_used": "用时：{hours}",
+        "time_used_label": "用时：",
+        "time_hours_unit": "小时",
         "edit": "编辑",
         "delete": "删除",
         "add_project": "+ 添加项目",
@@ -110,6 +131,22 @@ STRINGS: dict[str, dict[str, str]] = {
         "delete_with_time": "确定删除「{name}」？该项目今日已记录 {hours} 工时。",
         "unsaved_title": "未保存的更改",
         "unsaved_message": "关闭前是否保存待办清单的更改？",
+        "home_title": "工时记录",
+        "lets_roll": "开始工作！",
+        "time_log_history": "工时历史",
+        "calendar_title": "日历",
+        "home": "首页",
+        "prev_month": "◀",
+        "next_month": "▶",
+        "weekday_0": "一",
+        "weekday_1": "二",
+        "weekday_2": "三",
+        "weekday_3": "四",
+        "weekday_4": "五",
+        "weekday_5": "六",
+        "weekday_6": "日",
+        "no_time_logged": "该日期无工时记录。",
+        "history_summary_title": "{date} 工作记录",
     },
 }
 
@@ -339,9 +376,140 @@ def format_elapsed_hms(seconds: int, lang: str = "en") -> str:
     return " ".join(parts)
 
 
-def format_decimal_hours(seconds: int) -> str:
+def format_decimal_hours_value(seconds: int) -> str:
     hours = round(max(0, seconds) / 3600, 1)
-    return f"{hours:.1f}h"
+    return f"{hours:.1f}"
+
+
+def format_decimal_hours(seconds: int) -> str:
+    return f"{format_decimal_hours_value(seconds)}h"
+
+
+def parse_decimal_hours(text: str) -> float | None:
+    cleaned = text.strip().rstrip("hH").strip()
+    if not cleaned:
+        return None
+    try:
+        hours = float(cleaned)
+    except ValueError:
+        return None
+    if hours < 0:
+        return None
+    return hours
+
+
+def seconds_from_decimal_hours(hours: float) -> int:
+    return max(0, round(hours * 3600))
+
+
+def update_historical_project_seconds(
+    work_date: date,
+    project_name: str,
+    seconds: int,
+) -> None:
+    log_path = LOGS_DIR / f"{work_date.isoformat()}.json"
+    if not log_path.exists():
+        return
+
+    with log_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    projects = data.get("projects") or {}
+    if project_name not in projects:
+        projects[project_name] = default_project_state()
+    projects[project_name]["accumulated_seconds"] = max(0, int(seconds))
+    projects[project_name]["is_running"] = False
+    projects[project_name]["started_at"] = None
+
+    save_daily_state(
+        work_date,
+        str(data.get("todo_source") or ""),
+        projects,
+    )
+
+
+def format_month_year(month_date: date, lang: str = "en") -> str:
+    if normalize_language(lang) == "cn":
+        return f"{month_date.year}年{month_date.month}月"
+    return month_date.strftime("%B %Y")
+
+
+def weekday_labels(lang: str = "en") -> list[str]:
+    lang = normalize_language(lang)
+    labels = [translate(lang, f"weekday_{index}") for index in range(7)]
+    if lang == "cn":
+        return [f"周{label}" for label in labels]
+    return labels
+
+
+def day_has_logged_time(log_path: Path) -> bool:
+    try:
+        with log_path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return False
+    for entry in (data.get("projects") or {}).values():
+        if int(entry.get("accumulated_seconds", 0)) > 0:
+            return True
+    return False
+
+
+def iter_log_dates(logs_dir: Path) -> set[date]:
+    dates: set[date] = set()
+    if not logs_dir.exists():
+        return dates
+    for path in logs_dir.glob("*.json"):
+        if path.name == "settings.json":
+            continue
+        try:
+            log_date = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if day_has_logged_time(path):
+            dates.add(log_date)
+    return dates
+
+
+@dataclass
+class HistoryEntry:
+    name: str
+    description: str
+    seconds: int
+
+
+def load_historical_day(work_date: date, todo_dir: Path) -> list[HistoryEntry] | None:
+    log_path = LOGS_DIR / f"{work_date.isoformat()}.json"
+    if not log_path.exists():
+        return None
+
+    with log_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    descriptions: dict[str, str] = {}
+    todo_source = data.get("todo_source")
+    if todo_source:
+        todo_file = todo_dir / todo_source
+        if todo_file.exists():
+            for project in projects_from_document(load_todo_document(todo_file)):
+                descriptions[project.name] = project.description
+
+    entries: list[HistoryEntry] = []
+    for name, state in (data.get("projects") or {}).items():
+        seconds = int(state.get("accumulated_seconds", 0))
+        if seconds > 0:
+            entries.append(
+                HistoryEntry(
+                    name=name,
+                    description=descriptions.get(name, ""),
+                    seconds=seconds,
+                )
+            )
+
+    if not entries:
+        return None
+
+    entries.sort(key=lambda entry: entry.name)
+    return entries
 
 
 class TodoProjectDialog(ctk.CTkToplevel):
@@ -552,6 +720,10 @@ class TimeTrackerApp(ctk.CTk):
         self.selected_index = 0 if projects else -1
         self.todo_row_frames: list[ctk.CTkFrame] = []
         self.empty_label: ctk.CTkLabel | None = None
+        self.summary_mode: Literal["today", "history"] = "today"
+        self.summary_history_date: date | None = None
+        self.calendar_month = work_date.replace(day=1)
+        self.todo_dir = todo_path.parent
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
@@ -562,13 +734,19 @@ class TimeTrackerApp(ctk.CTk):
 
         self.container = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         self.container.pack(fill="both", expand=True, padx=24, pady=24)
+        self.container.grid_rowconfigure(0, weight=1)
+        self.container.grid_columnconfigure(0, weight=1)
 
+        self.home_frame = ctk.CTkFrame(self.container, fg_color=BG, corner_radius=0)
         self.tracker_frame = ctk.CTkFrame(self.container, fg_color=BG, corner_radius=0)
         self.summary_frame = ctk.CTkFrame(self.container, fg_color=BG, corner_radius=0)
+        self.calendar_frame = ctk.CTkFrame(self.container, fg_color=BG, corner_radius=0)
 
+        self._build_home_view()
         self._build_tracker_view()
         self._build_summary_view()
-        self._show_tracker()
+        self._build_calendar_view()
+        self._show_home()
         self._apply_language()
         self._tick()
 
@@ -581,27 +759,386 @@ class TimeTrackerApp(ctk.CTk):
         return format_display_date(self.work_date, self.lang)
 
     def _apply_language(self) -> None:
-        self.lang_selector.set("EN" if self.lang == "en" else "CN")
-        self.title(self._t("window_title", date=self._display_date()))
-        self.todo_header.configure(text=self._t("todo_header", date=self._display_date()))
-        self.clear_button.configure(text=self._t("clear"))
-        self.add_project_button.configure(text=self._t("add_project"))
-        self.edit_list_button.configure(text=self._t("edit_list"))
-        self.done_editing_button.configure(text=self._t("done_editing"))
-        if not self.todo_dirty:
+        for selector in (
+            getattr(self, "home_lang_selector", None),
+            getattr(self, "lang_selector", None),
+        ):
+            if selector is not None:
+                selector.set("EN" if self.lang == "en" else "CN")
+
+        if self.home_frame.winfo_ismapped():
+            self.title(self._t("home_title"))
+        elif self.tracker_frame.winfo_ismapped():
+            self.title(self._t("window_title", date=self._display_date()))
+        elif self.calendar_frame.winfo_ismapped():
+            self.title(self._t("calendar_title"))
+
+        if hasattr(self, "home_date_label"):
+            self.home_date_label.configure(text=self._display_date())
+        if hasattr(self, "lets_roll_button"):
+            self.lets_roll_button.configure(text=self._t("lets_roll"))
+        if hasattr(self, "time_log_history_button"):
+            self.time_log_history_button.configure(text=self._t("time_log_history"))
+
+        for button in (
+            getattr(self, "tracker_home_button", None),
+            getattr(self, "summary_home_button", None),
+            getattr(self, "calendar_home_button", None),
+        ):
+            if button is not None:
+                button.configure(text=self._t("home"))
+
+        if hasattr(self, "calendar_title_label"):
+            self.calendar_title_label.configure(text=self._t("calendar_title"))
+        if hasattr(self, "prev_month_button"):
+            self.prev_month_button.configure(text=self._t("prev_month"))
+        if hasattr(self, "next_month_button"):
+            self.next_month_button.configure(text=self._t("next_month"))
+
+        if hasattr(self, "todo_header"):
+            self.todo_header.configure(text=self._t("todo_header", date=self._display_date()))
+        if hasattr(self, "clear_button"):
+            self.clear_button.configure(text=self._t("clear"))
+        if hasattr(self, "add_project_button"):
+            self.add_project_button.configure(text=self._t("add_project"))
+        if hasattr(self, "edit_list_button"):
+            self.edit_list_button.configure(text=self._t("edit_list"))
+        if hasattr(self, "done_editing_button"):
+            self.done_editing_button.configure(text=self._t("done_editing"))
+        if not self.todo_dirty and hasattr(self, "save_list_button"):
             self.save_list_button.configure(text=self._t("save_list"))
-        self.off_work_button.configure(text=self._t("off_work"))
-        self.summary_title.configure(text=self._t("summary_title", date=self._display_date()))
-        self.back_button.configure(text=self._t("back"))
-        self._refresh_todo_edit_controls()
-        self._refresh_active_panel()
+        if hasattr(self, "off_work_button"):
+            self.off_work_button.configure(text=self._t("off_work"))
+        if hasattr(self, "back_button"):
+            self.back_button.configure(text=self._t("back"))
+
+        if hasattr(self, "todo_scroll") and self.tracker_frame.winfo_ismapped():
+            self._refresh_todo_edit_controls()
+        elif hasattr(self, "project_label"):
+            self._refresh_active_panel()
         if self.summary_frame.winfo_ismapped():
             self._render_summary()
+        if self.calendar_frame.winfo_ismapped():
+            self._render_calendar()
 
     def _on_language_change(self, value: str) -> None:
         self.lang = "cn" if value == "CN" else "en"
         save_language(self.lang)
         self._apply_language()
+
+    def _hide_all_pages(self) -> None:
+        for frame in (
+            self.home_frame,
+            self.tracker_frame,
+            self.summary_frame,
+            self.calendar_frame,
+        ):
+            frame.grid_forget()
+
+    def _confirm_unsaved_todo_if_needed(self) -> bool:
+        if not self.todo_dirty:
+            return True
+        result = messagebox.askyesnocancel(
+            self._t("unsaved_title"),
+            self._t("unsaved_message"),
+        )
+        if result is None:
+            return False
+        if result:
+            self._save_todo_list()
+        else:
+            self._discard_todo_changes()
+        return True
+
+    def _discard_todo_changes(self) -> None:
+        self.projects = projects_from_document(self.todo_document)
+        project_names = {project.name for project in self.projects}
+        for name in list(self.projects_state.keys()):
+            if name not in project_names:
+                del self.projects_state[name]
+        for project in self.projects:
+            if project.name not in self.projects_state:
+                self.projects_state[project.name] = default_project_state()
+        self.selected_index = 0 if self.projects else -1
+        self.todo_dirty = False
+        self.todo_edit_controls_visible = False
+        self._refresh_dirty_indicator()
+        if hasattr(self, "todo_scroll"):
+            self._refresh_todo_edit_controls(rebuild_list=False)
+
+    def _leave_tracker(self) -> bool:
+        return self._confirm_unsaved_todo_if_needed()
+
+    def _show_home(self) -> None:
+        if not self._leave_tracker():
+            return
+        was_on_tracker = self.tracker_frame.winfo_ismapped()
+        if was_on_tracker:
+            self._end_all_running()
+        self._hide_all_pages()
+        self.home_frame.grid(row=0, column=0, sticky="nsew")
+        self.title(self._t("home_title"))
+        self.home_date_label.configure(text=self._display_date())
+        self.update_idletasks()
+        if was_on_tracker:
+            self.after_idle(self._save_state)
+
+    def _show_tracker(self) -> None:
+        self._hide_all_pages()
+        self.tracker_frame.grid(row=0, column=0, sticky="nsew")
+        self.title(self._t("window_title", date=self._display_date()))
+        self._refresh_todo_selection()
+        self._refresh_active_panel()
+
+    def _show_calendar(self) -> None:
+        if not self._leave_tracker():
+            return
+        was_on_tracker = self.tracker_frame.winfo_ismapped()
+        if was_on_tracker:
+            self._end_all_running()
+        self._hide_all_pages()
+        self.calendar_frame.grid(row=0, column=0, sticky="nsew")
+        self.title(self._t("calendar_title"))
+        self._render_calendar()
+        if was_on_tracker:
+            self.after_idle(self._save_state)
+
+    def _show_summary(
+        self,
+        mode: Literal["today", "history"] = "today",
+        history_date: date | None = None,
+    ) -> None:
+        self.summary_mode = mode
+        self.summary_history_date = history_date
+        if mode == "today":
+            self._end_all_running()
+            self._save_state()
+        self._render_summary()
+        self._hide_all_pages()
+        self.summary_frame.grid(row=0, column=0, sticky="nsew")
+
+    def _on_summary_back(self) -> None:
+        if self.summary_mode == "history":
+            self._show_calendar()
+        else:
+            self._show_tracker()
+
+    def _on_calendar_date_click(self, clicked_date: date) -> None:
+        self._show_summary(mode="history", history_date=clicked_date)
+
+    def _change_calendar_month(self, delta: int) -> None:
+        month = self.calendar_month.month + delta
+        year = self.calendar_month.year
+        while month < 1:
+            month += 12
+            year -= 1
+        while month > 12:
+            month -= 12
+            year += 1
+        self.calendar_month = date(year, month, 1)
+        self._render_calendar()
+
+    def _build_home_view(self) -> None:
+        self.home_frame.grid_columnconfigure(0, weight=1)
+        self.home_frame.grid_rowconfigure(1, weight=1)
+
+        top_row = ctk.CTkFrame(self.home_frame, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        top_row.grid_columnconfigure(0, weight=1)
+
+        self.time_log_history_button = ctk.CTkButton(
+            top_row,
+            text="",
+            width=160,
+            height=36,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=14),
+            command=self._show_calendar,
+        )
+        self.time_log_history_button.grid(row=0, column=1, padx=(0, 8), sticky="e")
+
+        self.home_lang_selector = ctk.CTkSegmentedButton(
+            top_row,
+            values=["EN", "CN"],
+            width=120,
+            height=32,
+            font=ctk.CTkFont(size=13),
+            fg_color=WHITE,
+            selected_color=NAVY,
+            selected_hover_color="#1F2D4D",
+            unselected_color=WHITE,
+            unselected_hover_color=SELECTED_BG,
+            text_color=NAVY,
+            command=self._on_language_change,
+        )
+        self.home_lang_selector.set("EN" if self.lang == "en" else "CN")
+        self.home_lang_selector.grid(row=0, column=2, sticky="e")
+
+        center = ctk.CTkFrame(self.home_frame, fg_color="transparent")
+        center.grid(row=1, column=0, sticky="nsew")
+        center.grid_columnconfigure(0, weight=1)
+        center.grid_rowconfigure(0, weight=1)
+        center.grid_rowconfigure(2, weight=1)
+
+        self.home_date_label = ctk.CTkLabel(
+            center,
+            text="",
+            font=ctk.CTkFont(size=42, weight="bold"),
+            text_color=TEXT,
+        )
+        self.home_date_label.grid(row=1, column=0)
+
+        bottom_row = ctk.CTkFrame(self.home_frame, fg_color="transparent")
+        bottom_row.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        bottom_row.grid_columnconfigure(0, weight=1)
+
+        self.lets_roll_button = ctk.CTkButton(
+            bottom_row,
+            text="",
+            width=160,
+            height=44,
+            fg_color=NAVY,
+            hover_color="#1F2D4D",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            command=self._show_tracker,
+        )
+        self.lets_roll_button.grid(row=0, column=1, sticky="e")
+
+    def _build_calendar_view(self) -> None:
+        self.calendar_frame.grid_columnconfigure(0, weight=1)
+        self.calendar_frame.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(self.calendar_frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        header.grid_columnconfigure(1, weight=1)
+
+        self.calendar_home_button = ctk.CTkButton(
+            header,
+            text="",
+            width=80,
+            height=32,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=13),
+            command=self._show_home,
+        )
+        self.calendar_home_button.grid(row=0, column=0, sticky="w")
+
+        self.calendar_title_label = ctk.CTkLabel(
+            header,
+            text="",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color=TEXT,
+        )
+        self.calendar_title_label.grid(row=0, column=1)
+
+        nav = ctk.CTkFrame(header, fg_color="transparent")
+        nav.grid(row=0, column=2, sticky="e")
+
+        self.prev_month_button = ctk.CTkButton(
+            nav,
+            text="",
+            width=40,
+            height=32,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=14),
+            command=lambda: self._change_calendar_month(-1),
+        )
+        self.prev_month_button.pack(side="left", padx=(0, 8))
+
+        self.calendar_month_label = ctk.CTkLabel(
+            nav,
+            text="",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=TEXT,
+            width=140,
+        )
+        self.calendar_month_label.pack(side="left", padx=(0, 8))
+
+        self.next_month_button = ctk.CTkButton(
+            nav,
+            text="",
+            width=40,
+            height=32,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=14),
+            command=lambda: self._change_calendar_month(1),
+        )
+        self.next_month_button.pack(side="left")
+
+        self.calendar_body = ctk.CTkFrame(
+            self.calendar_frame,
+            fg_color=WHITE,
+            border_width=1,
+            border_color=BORDER,
+            corner_radius=12,
+        )
+        self.calendar_body.grid(row=1, column=0, sticky="nsew")
+        for col in range(7):
+            self.calendar_body.grid_columnconfigure(col, weight=1)
+
+    def _render_calendar(self) -> None:
+        for widget in self.calendar_body.winfo_children():
+            widget.destroy()
+
+        self.calendar_month_label.configure(
+            text=format_month_year(self.calendar_month, self.lang)
+        )
+
+        for col, label in enumerate(weekday_labels(self.lang)):
+            weekday = ctk.CTkLabel(
+                self.calendar_body,
+                text=label,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=MUTED,
+            )
+            weekday.grid(row=0, column=col, sticky="nsew", padx=4, pady=(16, 8))
+
+        logged_dates = iter_log_dates(LOGS_DIR)
+        weeks = calendar.Calendar(firstweekday=0).monthdayscalendar(
+            self.calendar_month.year,
+            self.calendar_month.month,
+        )
+
+        for week_index, week in enumerate(weeks, start=1):
+            for col_index, day in enumerate(week):
+                if day == 0:
+                    spacer = ctk.CTkFrame(self.calendar_body, fg_color="transparent", height=52)
+                    spacer.grid(row=week_index, column=col_index, sticky="nsew", padx=4, pady=4)
+                    continue
+
+                cell_date = date(self.calendar_month.year, self.calendar_month.month, day)
+                in_month = cell_date.month == self.calendar_month.month
+                has_log = cell_date in logged_dates
+
+                cell = ctk.CTkButton(
+                    self.calendar_body,
+                    text=str(day),
+                    height=52,
+                    fg_color=SELECTED_BG if has_log else WHITE,
+                    hover_color=SELECTED_BG,
+                    text_color=TEXT if in_month else MUTED,
+                    border_width=2 if has_log else 1,
+                    border_color=SELECTED_BORDER if has_log else BORDER,
+                    font=ctk.CTkFont(size=14, weight="bold" if has_log else "normal"),
+                    command=lambda d=cell_date: self._on_calendar_date_click(d),
+                )
+                cell.grid(row=week_index, column=col_index, sticky="nsew", padx=4, pady=4)
 
     def _selected_project(self) -> TodoProject | None:
         if self.selected_index < 0 or self.selected_index >= len(self.projects):
@@ -640,7 +1177,7 @@ class TimeTrackerApp(ctk.CTk):
         self.todo_edit_controls_visible = False
         self._refresh_todo_edit_controls()
 
-    def _refresh_todo_edit_controls(self) -> None:
+    def _refresh_todo_edit_controls(self, *, rebuild_list: bool | None = None) -> None:
         self.edit_list_button.grid_remove()
         self.add_project_button.grid_remove()
         self.done_editing_button.grid_remove()
@@ -655,7 +1192,10 @@ class TimeTrackerApp(ctk.CTk):
         else:
             self.edit_list_button.grid(row=0, column=2, padx=(0, 8), sticky="e")
 
-        self._rebuild_todo_list()
+        if rebuild_list is None:
+            rebuild_list = self.tracker_frame.winfo_ismapped()
+        if rebuild_list:
+            self._rebuild_todo_list()
 
     def _save_todo_list(self) -> None:
         doc = document_from_projects(self.todo_document, self.projects)
@@ -664,7 +1204,7 @@ class TimeTrackerApp(ctk.CTk):
         self.todo_dirty = False
         self.todo_edit_controls_visible = False
         self._refresh_dirty_indicator()
-        self._refresh_todo_edit_controls()
+        self._refresh_todo_edit_controls(rebuild_list=self.tracker_frame.winfo_ismapped())
         self.unsaved_label.configure(text=self._t("saved"), text_color=NAVY)
         self.after(
             2000,
@@ -805,7 +1345,22 @@ class TimeTrackerApp(ctk.CTk):
 
         lang_header = ctk.CTkFrame(self.tracker_frame, fg_color="transparent")
         lang_header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        lang_header.grid_columnconfigure(0, weight=1)
+        lang_header.grid_columnconfigure(1, weight=1)
+
+        self.tracker_home_button = ctk.CTkButton(
+            lang_header,
+            text="",
+            width=80,
+            height=32,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=13),
+            command=self._show_home,
+        )
+        self.tracker_home_button.grid(row=0, column=0, sticky="w")
 
         self.lang_selector = ctk.CTkSegmentedButton(
             lang_header,
@@ -822,7 +1377,7 @@ class TimeTrackerApp(ctk.CTk):
             command=self._on_language_change,
         )
         self.lang_selector.set("EN" if self.lang == "en" else "CN")
-        self.lang_selector.grid(row=0, column=1, sticky="e")
+        self.lang_selector.grid(row=0, column=2, sticky="e")
 
         active_panel = ctk.CTkFrame(
             self.tracker_frame,
@@ -936,7 +1491,7 @@ class TimeTrackerApp(ctk.CTk):
             fg_color=NAVY,
             hover_color="#1F2D4D",
             font=ctk.CTkFont(size=14, weight="bold"),
-            command=self._show_summary,
+            command=lambda: self._show_summary(mode="today"),
         )
         self.off_work_button.grid(row=0, column=4, sticky="e")
 
@@ -1157,7 +1712,22 @@ class TimeTrackerApp(ctk.CTk):
 
         header_row = ctk.CTkFrame(self.summary_frame, fg_color="transparent")
         header_row.grid(row=0, column=0, sticky="ew", pady=(0, 16))
-        header_row.grid_columnconfigure(0, weight=1)
+        header_row.grid_columnconfigure(1, weight=1)
+
+        self.summary_home_button = ctk.CTkButton(
+            header_row,
+            text="",
+            width=80,
+            height=32,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=13),
+            command=self._show_home,
+        )
+        self.summary_home_button.grid(row=0, column=0, sticky="w")
 
         self.summary_title = ctk.CTkLabel(
             header_row,
@@ -1166,7 +1736,7 @@ class TimeTrackerApp(ctk.CTk):
             text_color=TEXT,
             anchor="w",
         )
-        self.summary_title.grid(row=0, column=0, sticky="w")
+        self.summary_title.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         self.back_button = ctk.CTkButton(
             header_row,
@@ -1179,9 +1749,9 @@ class TimeTrackerApp(ctk.CTk):
             border_width=1,
             border_color=NAVY,
             font=ctk.CTkFont(size=13),
-            command=self._show_tracker,
+            command=self._on_summary_back,
         )
-        self.back_button.grid(row=0, column=1, sticky="e")
+        self.back_button.grid(row=0, column=2, sticky="e")
 
         self.summary_scroll = ctk.CTkScrollableFrame(
             self.summary_frame,
@@ -1197,63 +1767,166 @@ class TimeTrackerApp(ctk.CTk):
         for widget in self.summary_scroll.winfo_children():
             widget.destroy()
 
+        if self.summary_mode == "history" and self.summary_history_date is not None:
+            display = format_display_date(self.summary_history_date, self.lang)
+            self.summary_title.configure(
+                text=self._t("history_summary_title", date=display)
+            )
+            entries = load_historical_day(self.summary_history_date, self.todo_dir)
+            if not entries:
+                empty = ctk.CTkLabel(
+                    self.summary_scroll,
+                    text=self._t("no_time_logged"),
+                    font=ctk.CTkFont(size=16),
+                    text_color=MUTED,
+                    anchor="w",
+                )
+                empty.grid(row=0, column=0, sticky="ew", padx=24, pady=24)
+                return
+
+            for index, entry in enumerate(entries):
+                self._render_summary_block(
+                    index,
+                    entry.name,
+                    entry.description or self._t("no_description"),
+                    entry.seconds,
+                    on_seconds_change=self._on_history_seconds_change,
+                )
+            return
+
+        self.summary_title.configure(
+            text=self._t("summary_title", date=self._display_date())
+        )
         now = datetime.now()
-        for index, project in enumerate(self.projects):
+        logged_projects: list[tuple[TodoProject, int]] = []
+        for project in self.projects:
             seconds = get_elapsed_seconds(self._project_state(project.name), now)
-            block = ctk.CTkFrame(
+            if seconds > 0:
+                logged_projects.append((project, seconds))
+
+        if not logged_projects:
+            empty = ctk.CTkLabel(
                 self.summary_scroll,
-                fg_color=BG if index % 2 == 0 else WHITE,
-                corner_radius=8,
-            )
-            block.grid(row=index, column=0, sticky="ew", padx=16, pady=8)
-            block.grid_columnconfigure(0, weight=1)
-
-            title = ctk.CTkLabel(
-                block,
-                text=f"{index + 1}. {project.name}",
-                font=ctk.CTkFont(size=16, weight="bold"),
-                text_color=TEXT,
-                anchor="w",
-            )
-            title.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
-
-            description = project.description or self._t("no_description")
-            desc_label = ctk.CTkLabel(
-                block,
-                text=description,
-                font=ctk.CTkFont(size=14),
+                text=self._t("no_time_logged"),
+                font=ctk.CTkFont(size=16),
                 text_color=MUTED,
                 anchor="w",
-                justify="left",
-                wraplength=760,
             )
-            desc_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 4))
+            empty.grid(row=0, column=0, sticky="ew", padx=24, pady=24)
+            return
 
-            time_label = ctk.CTkLabel(
-                block,
-                text=self._t("time_used", hours=format_decimal_hours(seconds)),
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color=NAVY,
-                anchor="w",
+        for index, (project, seconds) in enumerate(logged_projects):
+            self._render_summary_block(
+                index,
+                project.name,
+                project.description or self._t("no_description"),
+                seconds,
+                on_seconds_change=self._on_today_seconds_change,
             )
-            time_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
 
-    def _show_tracker(self) -> None:
-        self.summary_frame.grid_forget()
-        self.tracker_frame.grid(row=0, column=0, sticky="nsew")
-        self.container.grid_rowconfigure(0, weight=1)
-        self.container.grid_columnconfigure(0, weight=1)
-        self._refresh_todo_selection()
-        self._refresh_active_panel()
-
-    def _show_summary(self) -> None:
-        self._end_all_running()
+    def _on_today_seconds_change(self, project_name: str, seconds: int) -> None:
+        state = self._project_state(project_name)
+        state["accumulated_seconds"] = seconds
+        state["is_running"] = False
+        state["started_at"] = None
         self._save_state()
-        self._render_summary()
-        self.tracker_frame.grid_forget()
-        self.summary_frame.grid(row=0, column=0, sticky="nsew")
-        self.container.grid_rowconfigure(0, weight=1)
-        self.container.grid_columnconfigure(0, weight=1)
+        if seconds == 0:
+            self._render_summary()
+
+    def _on_history_seconds_change(self, project_name: str, seconds: int) -> None:
+        if self.summary_history_date is None:
+            return
+        update_historical_project_seconds(
+            self.summary_history_date,
+            project_name,
+            seconds,
+        )
+        if seconds == 0:
+            self._render_summary()
+
+    def _render_summary_block(
+        self,
+        index: int,
+        name: str,
+        description: str,
+        seconds: int,
+        on_seconds_change: Callable[[str, int], None],
+    ) -> None:
+        block = ctk.CTkFrame(
+            self.summary_scroll,
+            fg_color=BG if index % 2 == 0 else WHITE,
+            corner_radius=8,
+        )
+        block.grid(row=index, column=0, sticky="ew", padx=16, pady=8)
+        block.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            block,
+            text=f"{index + 1}. {name}",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=TEXT,
+            anchor="w",
+        )
+        title.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+
+        desc_label = ctk.CTkLabel(
+            block,
+            text=description,
+            font=ctk.CTkFont(size=14),
+            text_color=MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        )
+        desc_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 4))
+
+        time_row = ctk.CTkFrame(block, fg_color="transparent")
+        time_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 14))
+
+        time_prefix = ctk.CTkLabel(
+            time_row,
+            text=self._t("time_used_label"),
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=NAVY,
+            anchor="w",
+        )
+        time_prefix.grid(row=0, column=0, sticky="w")
+
+        current_seconds = [seconds]
+        hours_var = ctk.StringVar(value=format_decimal_hours_value(seconds))
+        time_entry = ctk.CTkEntry(
+            time_row,
+            width=72,
+            height=28,
+            textvariable=hours_var,
+            font=ctk.CTkFont(size=14),
+            justify="center",
+        )
+        time_entry.grid(row=0, column=1, padx=(6, 4), sticky="w")
+
+        time_suffix = ctk.CTkLabel(
+            time_row,
+            text=self._t("time_hours_unit"),
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=NAVY,
+            anchor="w",
+        )
+        time_suffix.grid(row=0, column=2, sticky="w")
+
+        def commit_time(_event: object | None = None) -> None:
+            parsed = parse_decimal_hours(hours_var.get())
+            if parsed is None:
+                hours_var.set(format_decimal_hours_value(current_seconds[0]))
+                return
+            new_seconds = seconds_from_decimal_hours(parsed)
+            hours_var.set(format_decimal_hours_value(new_seconds))
+            if new_seconds == current_seconds[0]:
+                return
+            current_seconds[0] = new_seconds
+            on_seconds_change(name, new_seconds)
+
+        time_entry.bind("<FocusOut>", commit_time)
+        time_entry.bind("<Return>", commit_time)
 
     def _tick(self) -> None:
         if self.tracker_frame.winfo_ismapped():
@@ -1261,15 +1934,8 @@ class TimeTrackerApp(ctk.CTk):
         self.after(1000, self._tick)
 
     def _on_close(self) -> None:
-        if self.todo_dirty:
-            result = messagebox.askyesnocancel(
-                self._t("unsaved_title"),
-                self._t("unsaved_message"),
-            )
-            if result is None:
-                return
-            if result:
-                self._save_todo_list()
+        if self.tracker_frame.winfo_ismapped() and not self._confirm_unsaved_todo_if_needed():
+            return
         self._end_all_running()
         self._save_state()
         self.destroy()
