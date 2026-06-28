@@ -70,6 +70,63 @@ def parse_date(value: str) -> date:
         ) from exc
 
 
+GMAIL_HTTP_TIMEOUT = 60
+COMMON_LOCAL_PROXY_PORTS = (7890, 7897, 10809, 1080)
+
+
+def resolve_proxy_url() -> str | None:
+    for key in (
+        "GMAIL_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = os.getenv(key)
+        if value:
+            return value.strip()
+    return None
+
+
+def detect_local_proxy_url() -> str | None:
+    for port in COMMON_LOCAL_PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return f"http://127.0.0.1:{port}"
+        except OSError:
+            continue
+    return None
+
+
+def configure_gmail_proxy() -> str | None:
+    """Configure proxy for Gmail API calls (httplib2 needs PySocks for HTTPS)."""
+    proxy_url = resolve_proxy_url() or detect_local_proxy_url()
+    if not proxy_url:
+        return None
+
+    os.environ.setdefault("HTTPS_PROXY", proxy_url)
+    os.environ.setdefault("HTTP_PROXY", proxy_url)
+    print(f"Using proxy for Gmail API: {proxy_url}")
+    return proxy_url
+
+
+def build_authorized_gmail_http(creds, proxy_url: str | None):
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
+
+    if proxy_url:
+        http = httplib2.Http(
+            proxy_info=httplib2.proxy_info_from_url(proxy_url),
+            timeout=GMAIL_HTTP_TIMEOUT,
+        )
+    else:
+        http = httplib2.Http(timeout=GMAIL_HTTP_TIMEOUT)
+
+    return AuthorizedHttp(creds, http=http)
+
+
 def build_query(start_date: date, end_date: date) -> str:
     """Build an inclusive Gmail search query for the given date range."""
     if start_date > end_date:
@@ -81,6 +138,7 @@ def build_query(start_date: date, end_date: date) -> str:
 
 
 def get_gmail_service(credentials_path: Path, token_path: Path):
+    proxy_url = configure_gmail_proxy()
     creds = None
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
@@ -100,9 +158,10 @@ def get_gmail_service(credentials_path: Path, token_path: Path):
             )
             creds = flow.run_local_server(port=0)
 
-        token_path.write_text(creds.to_json())
+        token_path.write_text(creds.to_json(), encoding="utf-8")
 
-    return build("gmail", "v1", credentials=creds)
+    authorized_http = build_authorized_gmail_http(creds, proxy_url)
+    return build("gmail", "v1", http=authorized_http)
 
 
 def header_value(headers: list[dict], name: str) -> str | None:
@@ -449,7 +508,10 @@ def summarize_emails_from_json(
     }
 
     out_path = output_path or default_summarized_output_path(input_path)
-    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    out_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"Saved summarized emails to {out_path}")
     return result
 
@@ -484,7 +546,10 @@ def categorize_emails_from_json(
     }
 
     out_path = output_path or default_categorized_output_path(input_path)
-    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    out_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"Saved categorized emails to {out_path}")
     return result
 
@@ -524,7 +589,10 @@ def process_emails_from_json(
     }
 
     out_path = output_path or default_processed_output_path(input_path)
-    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    out_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"Saved processed emails to {out_path}")
     return result
 
@@ -555,7 +623,10 @@ def run_fetch(args: argparse.Namespace) -> None:
         "emails": emails,
     }
 
-    output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+    output_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(f"Saved {len(emails)} emails to {output_path}")
 
 
@@ -726,6 +797,7 @@ def main() -> None:
 
 
 # python3 fetch_gmail.py fetch --start-date 2026-06-06 --end-date 2026-06-07
+# python3 fetch_gmail.py process --input emails_2026-06-06_2026-06-07.json
 # python3 fetch_gmail.py process --input emails_2026-06-06_2026-06-07.json
 # python3 fetch_gmail.py todo --input emails_2026-06-06_2026-06-07_processed.json
 # python3 time_tracker.py emails_2026-06-06_2026-06-07_todo.json
