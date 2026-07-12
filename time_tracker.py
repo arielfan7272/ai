@@ -312,6 +312,7 @@ def default_project_state() -> dict[str, Any]:
         "accumulated_seconds": 0,
         "is_running": False,
         "started_at": None,
+        "description": "",
     }
 
 
@@ -345,6 +346,7 @@ def load_daily_state(
             "accumulated_seconds": int(entry.get("accumulated_seconds", 0)),
             "is_running": bool(entry.get("is_running", False)),
             "started_at": entry.get("started_at"),
+            "description": str(entry.get("description") or ""),
         }
 
     return state
@@ -536,6 +538,49 @@ def load_project_descriptions_for_day(work_date: date, log_data: dict) -> dict[s
     return descriptions
 
 
+def backfill_log_descriptions(work_date: date) -> bool:
+    log_path = LOGS_DIR / f"{work_date.isoformat()}.json"
+    if not log_path.exists():
+        return False
+
+    with log_path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    fallback_descriptions = load_project_descriptions_for_day(work_date, data)
+    projects = data.get("projects") or {}
+    changed = False
+
+    for name, state in projects.items():
+        if int(state.get("accumulated_seconds", 0)) <= 0:
+            continue
+        stored = str(state.get("description") or "").strip()
+        if stored:
+            continue
+        fallback = fallback_descriptions.get(name, "").strip()
+        if not fallback:
+            continue
+        state["description"] = fallback
+        changed = True
+
+    if not changed:
+        return False
+
+    save_daily_state(
+        work_date,
+        str(data.get("todo_source") or ""),
+        projects,
+    )
+    return True
+
+
+def backfill_all_log_descriptions() -> int:
+    updated = 0
+    for log_date in sorted(iter_log_dates(LOGS_DIR)):
+        if backfill_log_descriptions(log_date):
+            updated += 1
+    return updated
+
+
 def load_historical_day(work_date: date) -> list[HistoryEntry] | None:
     log_path = LOGS_DIR / f"{work_date.isoformat()}.json"
     if not log_path.exists():
@@ -544,16 +589,30 @@ def load_historical_day(work_date: date) -> list[HistoryEntry] | None:
     with log_path.open(encoding="utf-8") as handle:
         data = json.load(handle)
 
-    descriptions = load_project_descriptions_for_day(work_date, data)
+    fallback_descriptions = load_project_descriptions_for_day(work_date, data)
+    projects = data.get("projects") or {}
+    needs_backfill = any(
+        int(state.get("accumulated_seconds", 0)) > 0
+        and not str(state.get("description") or "").strip()
+        and fallback_descriptions.get(name, "").strip()
+        for name, state in projects.items()
+    )
+    if needs_backfill:
+        backfill_log_descriptions(work_date)
+        with log_path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        projects = data.get("projects") or {}
 
     entries: list[HistoryEntry] = []
-    for name, state in (data.get("projects") or {}).items():
+    for name, state in projects.items():
         seconds = int(state.get("accumulated_seconds", 0))
         if seconds > 0:
+            stored_description = str(state.get("description") or "").strip()
+            description = stored_description or fallback_descriptions.get(name, "")
             entries.append(
                 HistoryEntry(
                     name=name,
-                    description=descriptions.get(name, ""),
+                    description=description,
                     seconds=seconds,
                 )
             )
@@ -1202,7 +1261,12 @@ class TimeTrackerApp(ctk.CTk):
             self.projects_state[name] = default_project_state()
         return self.projects_state[name]
 
+    def _sync_descriptions_to_state(self) -> None:
+        for project in self.projects:
+            self._project_state(project.name)["description"] = project.description
+
     def _save_state(self) -> None:
+        self._sync_descriptions_to_state()
         save_daily_state(self.work_date, self.todo_source, self.projects_state)
 
     def _mark_dirty(self) -> None:
@@ -2009,11 +2073,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="UI language (en or cn). Overrides saved preference.",
     )
+    parser.add_argument(
+        "--backfill-descriptions",
+        action="store_true",
+        help="Backfill missing project descriptions in existing daily time logs.",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.backfill_descriptions:
+        updated = backfill_all_log_descriptions()
+        print(f"Backfilled descriptions in {updated} log file(s).")
+        return
+
     work_date = args.date or date.today()
     todo_document, todo_path = resolve_daily_todo(work_date)
     projects = projects_from_document(todo_document)
