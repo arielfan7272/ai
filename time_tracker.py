@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Legal counsel time tracker — load a todo JSON and track daily project time."""
+"""Legal counsel time tracker — per-day todo lists and daily project time logs."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ WHITE = "#FFFFFF"
 WARN = "#B45309"
 
 LOGS_DIR = Path(".time_logs")
+TODOS_DIR = LOGS_DIR / "todos"
 SETTINGS_PATH = LOGS_DIR / "settings.json"
 
 STRINGS: dict[str, dict[str, str]] = {
@@ -263,7 +264,35 @@ def document_from_projects(base_doc: dict, projects: list[TodoProject]) -> dict:
     return doc
 
 
+def daily_todo_path(work_date: date) -> Path:
+    return TODOS_DIR / f"{work_date.isoformat()}.json"
+
+
+def daily_todo_source_name(work_date: date) -> str:
+    return f"todos/{work_date.isoformat()}.json"
+
+
+def create_blank_todo_document(work_date: date) -> dict:
+    return {"date": work_date.isoformat(), "projects": []}
+
+
+def load_daily_todo(work_date: date) -> dict | None:
+    path = daily_todo_path(work_date)
+    if not path.exists():
+        return None
+    return load_todo_document(path)
+
+
+def resolve_daily_todo(work_date: date) -> tuple[dict, Path]:
+    path = daily_todo_path(work_date)
+    existing = load_daily_todo(work_date)
+    if existing is not None:
+        return existing, path
+    return create_blank_todo_document(work_date), path
+
+
 def save_todo_document(path: Path, doc: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     directory = path.parent
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -477,7 +506,37 @@ class HistoryEntry:
     seconds: int
 
 
-def load_historical_day(work_date: date, todo_dir: Path) -> list[HistoryEntry] | None:
+def load_project_descriptions_for_day(work_date: date, log_data: dict) -> dict[str, str]:
+    descriptions: dict[str, str] = {}
+
+    daily_path = daily_todo_path(work_date)
+    if daily_path.exists():
+        for project in projects_from_document(load_todo_document(daily_path)):
+            descriptions[project.name] = project.description
+        return descriptions
+
+    todo_source = log_data.get("todo_source")
+    if not todo_source:
+        return descriptions
+
+    todo_source_path = Path(str(todo_source))
+    candidates = [
+        LOGS_DIR / todo_source_path,
+        todo_source_path if todo_source_path.is_absolute() else None,
+        Path.cwd() / todo_source_path,
+    ]
+    for todo_file in candidates:
+        if todo_file is None:
+            continue
+        if todo_file.exists():
+            for project in projects_from_document(load_todo_document(todo_file)):
+                descriptions[project.name] = project.description
+            break
+
+    return descriptions
+
+
+def load_historical_day(work_date: date) -> list[HistoryEntry] | None:
     log_path = LOGS_DIR / f"{work_date.isoformat()}.json"
     if not log_path.exists():
         return None
@@ -485,13 +544,7 @@ def load_historical_day(work_date: date, todo_dir: Path) -> list[HistoryEntry] |
     with log_path.open(encoding="utf-8") as handle:
         data = json.load(handle)
 
-    descriptions: dict[str, str] = {}
-    todo_source = data.get("todo_source")
-    if todo_source:
-        todo_file = todo_dir / todo_source
-        if todo_file.exists():
-            for project in projects_from_document(load_todo_document(todo_file)):
-                descriptions[project.name] = project.description
+    descriptions = load_project_descriptions_for_day(work_date, data)
 
     entries: list[HistoryEntry] = []
     for name, state in (data.get("projects") or {}).items():
@@ -711,7 +764,7 @@ class TimeTrackerApp(ctk.CTk):
         self.projects = projects
         self.work_date = work_date
         self.todo_path = todo_path
-        self.todo_source = todo_path.name
+        self.todo_source = daily_todo_source_name(work_date)
         self.todo_document = todo_document
         self.todo_dirty = False
         self.todo_edit_controls_visible = False
@@ -723,7 +776,6 @@ class TimeTrackerApp(ctk.CTk):
         self.summary_mode: Literal["today", "history"] = "today"
         self.summary_history_date: date | None = None
         self.calendar_month = work_date.replace(day=1)
-        self.todo_dir = todo_path.parent
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
@@ -1772,7 +1824,7 @@ class TimeTrackerApp(ctk.CTk):
             self.summary_title.configure(
                 text=self._t("history_summary_title", date=display)
             )
-            entries = load_historical_day(self.summary_history_date, self.todo_dir)
+            entries = load_historical_day(self.summary_history_date)
             if not entries:
                 empty = ctk.CTkLabel(
                     self.summary_scroll,
@@ -1943,12 +1995,7 @@ class TimeTrackerApp(ctk.CTk):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Track daily time spent on projects from an email-generated todo list.",
-    )
-    parser.add_argument(
-        "todo_file",
-        type=Path,
-        help="Path to the todo JSON file (e.g. emails_2026-06-06_2026-06-07_todo.json).",
+        description="Track daily time spent on per-day todo lists.",
     )
     parser.add_argument(
         "--date",
@@ -1967,18 +2014,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    todo_path = args.todo_file.resolve()
-    if not todo_path.exists():
-        raise SystemExit(f"Todo file not found: {todo_path}")
-
-    todo_document = load_todo_document(todo_path)
-    projects = projects_from_document(todo_document)
     work_date = args.date or date.today()
+    todo_document, todo_path = resolve_daily_todo(work_date)
+    projects = projects_from_document(todo_document)
     lang = normalize_language(args.lang) if args.lang else load_language()
     daily_state = load_daily_state(
         work_date,
         [project.name for project in projects],
-        todo_path.name,
+        daily_todo_source_name(work_date),
     )
 
     app = TimeTrackerApp(
