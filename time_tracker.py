@@ -9,6 +9,7 @@ import copy
 import json
 import os
 import tempfile
+import threading
 import tkinter.messagebox as messagebox
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import customtkinter as ctk
+from dotenv import load_dotenv
 
 BG = "#F8F9FA"
 TEXT = "#1A1A2E"
@@ -30,6 +32,7 @@ WARN = "#B45309"
 
 LOGS_DIR = Path(".time_logs")
 TODOS_DIR = LOGS_DIR / "todos"
+EMAILS_DIR = LOGS_DIR / "emails"
 SETTINGS_PATH = LOGS_DIR / "settings.json"
 
 STRINGS: dict[str, dict[str, str]] = {
@@ -91,6 +94,29 @@ STRINGS: dict[str, dict[str, str]] = {
         "weekday_6": "Sun",
         "no_time_logged": "No time logged for this date.",
         "history_summary_title": "Work history for {date}",
+        "generate_from_emails": "From emails",
+        "generate_dialog_title": "Generate from emails",
+        "generate_dialog_body": (
+            "Fetch Gmail for a date range and generate a to-do list. "
+            "New items will be merged into your list for {date}."
+        ),
+        "generate_range_label": "Email date range",
+        "generate_from_date": "From",
+        "generate_to_date": "To",
+        "generate_invalid_dates": "Enter valid dates in YYYY-MM-DD format.",
+        "generate_range_order": "The start date must be on or before the end date.",
+        "generate_lang_label": "To-do language",
+        "generate_confirm": "Generate",
+        "generate_progress_title": "Generating to-do list",
+        "generate_step_fetch": "Fetching emails…",
+        "generate_step_process": "Categorizing and summarizing…",
+        "generate_step_generate": "Generating to-do items…",
+        "generate_success": "Merged {count} project(s) from email.",
+        "generate_empty_inbox": "No emails found for {range}.",
+        "generate_empty_todo": "No actionable to-do items were generated from the selected emails.",
+        "generate_error_title": "Could not generate to-do list",
+        "generate_error_generic": "Something went wrong:\n{error}",
+        "generate_busy": "Generation already in progress.",
     },
     "cn": {
         "window_title": "工时记录 — {date}",
@@ -148,6 +174,29 @@ STRINGS: dict[str, dict[str, str]] = {
         "weekday_6": "日",
         "no_time_logged": "该日期无工时记录。",
         "history_summary_title": "{date} 工作记录",
+        "generate_from_emails": "根据邮件生成",
+        "generate_dialog_title": "根据邮件生成待办",
+        "generate_dialog_body": (
+            "选择邮件日期范围并生成待办清单。"
+            "新事项会合并到 {date} 的当前清单中。"
+        ),
+        "generate_range_label": "邮件日期范围",
+        "generate_from_date": "开始",
+        "generate_to_date": "结束",
+        "generate_invalid_dates": "请输入有效日期，格式为 YYYY-MM-DD。",
+        "generate_range_order": "开始日期不能晚于结束日期。",
+        "generate_lang_label": "待办语言",
+        "generate_confirm": "生成",
+        "generate_progress_title": "正在生成待办清单",
+        "generate_step_fetch": "正在获取邮件…",
+        "generate_step_process": "正在分类与摘要…",
+        "generate_step_generate": "正在生成待办事项…",
+        "generate_success": "已从邮件合并 {count} 个项目。",
+        "generate_empty_inbox": "{range} 没有找到邮件。",
+        "generate_empty_todo": "所选邮件未生成可操作的待办事项。",
+        "generate_error_title": "无法生成待办清单",
+        "generate_error_generic": "发生错误：\n{error}",
+        "generate_busy": "正在生成中，请稍候。",
     },
 }
 
@@ -624,6 +673,282 @@ def load_historical_day(work_date: date) -> list[HistoryEntry] | None:
     return entries
 
 
+def merge_generated_projects(
+    existing: list[TodoProject],
+    generated: list[TodoProject],
+) -> tuple[list[TodoProject], int]:
+    """Merge generated projects into existing ones.
+
+    Same project name (stripped, case-sensitive) merges item texts without
+    duplicating identical texts. Returns (merged_list, projects_touched).
+    """
+    merged = [
+        TodoProject(
+            name=project.name,
+            items=[TodoItem(text=item.text, done=item.done) for item in project.items],
+        )
+        for project in existing
+    ]
+    by_name = {project.name.strip(): project for project in merged}
+    touched = 0
+
+    for gen in generated:
+        name = gen.name.strip()
+        if not name:
+            continue
+        new_items = [
+            TodoItem(text=item.text.strip(), done=False)
+            for item in gen.items
+            if item.text.strip()
+        ]
+        if not new_items:
+            continue
+
+        if name in by_name:
+            target = by_name[name]
+            existing_texts = {item.text for item in target.items}
+            added = False
+            for item in new_items:
+                if item.text not in existing_texts:
+                    target.items.append(item)
+                    existing_texts.add(item.text)
+                    added = True
+            if added:
+                touched += 1
+        else:
+            project = TodoProject(name=name, items=new_items)
+            merged.append(project)
+            by_name[name] = project
+            touched += 1
+
+    return merged, touched
+
+
+class GenerateTodoDialog(ctk.CTkToplevel):
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        lang: str,
+        work_date: date,
+        on_confirm: Callable[[str, date, date], None],
+    ) -> None:
+        super().__init__(parent)
+        self.lang = normalize_language(lang)
+        self.on_confirm = on_confirm
+        self.selected_lang = self.lang
+        self.work_date = work_date
+
+        self.title(translate(self.lang, "generate_dialog_title"))
+        self.geometry("460x360")
+        self.minsize(420, 340)
+        self.configure(fg_color=BG)
+        self.transient(parent)
+        self.grab_set()
+
+        body = ctk.CTkFrame(self, fg_color=WHITE, border_width=1, border_color=BORDER)
+        body.pack(fill="both", expand=True, padx=20, pady=20)
+        body.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            body,
+            text=translate(self.lang, "generate_dialog_title"),
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=TEXT,
+            anchor="w",
+        )
+        title.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 8))
+
+        body_text = ctk.CTkLabel(
+            body,
+            text=translate(
+                self.lang,
+                "generate_dialog_body",
+                date=format_display_date(work_date, self.lang),
+            ),
+            font=ctk.CTkFont(size=13),
+            text_color=MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        )
+        body_text.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 12))
+
+        range_label = ctk.CTkLabel(
+            body,
+            text=translate(self.lang, "generate_range_label"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT,
+            anchor="w",
+        )
+        range_label.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
+
+        range_row = ctk.CTkFrame(body, fg_color="transparent")
+        range_row.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 8))
+        range_row.grid_columnconfigure(1, weight=1)
+        range_row.grid_columnconfigure(3, weight=1)
+
+        from_label = ctk.CTkLabel(
+            range_row,
+            text=translate(self.lang, "generate_from_date"),
+            font=ctk.CTkFont(size=13),
+            text_color=MUTED,
+        )
+        from_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        self.start_entry = ctk.CTkEntry(
+            range_row,
+            height=36,
+            font=ctk.CTkFont(size=13),
+            placeholder_text="YYYY-MM-DD",
+        )
+        self.start_entry.grid(row=0, column=1, sticky="ew", padx=(0, 16))
+        self.start_entry.insert(0, work_date.isoformat())
+
+        to_label = ctk.CTkLabel(
+            range_row,
+            text=translate(self.lang, "generate_to_date"),
+            font=ctk.CTkFont(size=13),
+            text_color=MUTED,
+        )
+        to_label.grid(row=0, column=2, sticky="w", padx=(0, 8))
+
+        self.end_entry = ctk.CTkEntry(
+            range_row,
+            height=36,
+            font=ctk.CTkFont(size=13),
+            placeholder_text="YYYY-MM-DD",
+        )
+        self.end_entry.grid(row=0, column=3, sticky="ew")
+        self.end_entry.insert(0, work_date.isoformat())
+
+        lang_label = ctk.CTkLabel(
+            body,
+            text=translate(self.lang, "generate_lang_label"),
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=TEXT,
+            anchor="w",
+        )
+        lang_label.grid(row=4, column=0, sticky="ew", padx=20, pady=(8, 8))
+
+        self.lang_selector = ctk.CTkSegmentedButton(
+            body,
+            values=["EN", "CN"],
+            width=160,
+            height=36,
+            font=ctk.CTkFont(size=13),
+            fg_color=BG,
+            selected_color=NAVY,
+            selected_hover_color="#1F2D4D",
+            unselected_color=WHITE,
+            unselected_hover_color=SELECTED_BG,
+            text_color=NAVY,
+            command=self._on_lang_change,
+        )
+        self.lang_selector.set("EN" if self.selected_lang == "en" else "CN")
+        self.lang_selector.grid(row=5, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        self.error_label = ctk.CTkLabel(
+            body,
+            text="",
+            text_color=CLEAR_COLOR,
+            anchor="w",
+            wraplength=380,
+            font=ctk.CTkFont(size=12),
+        )
+        self.error_label.grid(row=6, column=0, sticky="ew", padx=20, pady=(0, 4))
+
+        actions = ctk.CTkFrame(body, fg_color="transparent")
+        actions.grid(row=7, column=0, sticky="ew", padx=20, pady=(8, 20))
+        actions.grid_columnconfigure(0, weight=1)
+
+        cancel_btn = ctk.CTkButton(
+            actions,
+            text=translate(self.lang, "cancel"),
+            width=90,
+            height=36,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=13),
+            command=self.destroy,
+        )
+        cancel_btn.grid(row=0, column=1, padx=(0, 8), sticky="e")
+
+        confirm_btn = ctk.CTkButton(
+            actions,
+            text=translate(self.lang, "generate_confirm"),
+            width=110,
+            height=36,
+            fg_color=NAVY,
+            hover_color="#1F2D4D",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._on_confirm,
+        )
+        confirm_btn.grid(row=0, column=2, sticky="e")
+
+    def _on_lang_change(self, value: str) -> None:
+        self.selected_lang = "cn" if value == "CN" else "en"
+
+    def _parse_entry_date(self, value: str) -> date | None:
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    def _on_confirm(self) -> None:
+        start = self._parse_entry_date(self.start_entry.get())
+        end = self._parse_entry_date(self.end_entry.get())
+        if start is None or end is None:
+            self.error_label.configure(
+                text=translate(self.lang, "generate_invalid_dates")
+            )
+            return
+        if start > end:
+            self.error_label.configure(
+                text=translate(self.lang, "generate_range_order")
+            )
+            return
+
+        lang = self.selected_lang
+        self.destroy()
+        self.on_confirm(lang, start, end)
+
+
+class GenerateProgressDialog(ctk.CTkToplevel):
+    def __init__(self, parent: ctk.CTk, lang: str) -> None:
+        super().__init__(parent)
+        self.lang = normalize_language(lang)
+        self.title(translate(self.lang, "generate_progress_title"))
+        self.geometry("420x160")
+        self.minsize(380, 140)
+        self.configure(fg_color=BG)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        body = ctk.CTkFrame(self, fg_color=WHITE, border_width=1, border_color=BORDER)
+        body.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.status_label = ctk.CTkLabel(
+            body,
+            text=translate(self.lang, "generate_step_fetch"),
+            font=ctk.CTkFont(size=14),
+            text_color=TEXT,
+            anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=24, pady=(28, 12))
+
+        self.progress = ctk.CTkProgressBar(body, height=8, progress_color=NAVY)
+        self.progress.pack(fill="x", padx=24, pady=(0, 28))
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
+
+    def set_step(self, key: str) -> None:
+        self.status_label.configure(text=translate(self.lang, key))
+
+
 class TodoProjectDialog(ctk.CTkToplevel):
     def __init__(
         self,
@@ -835,6 +1160,10 @@ class TimeTrackerApp(ctk.CTk):
         self.summary_mode: Literal["today", "history"] = "today"
         self.summary_history_date: date | None = None
         self.calendar_month = work_date.replace(day=1)
+        self._generate_in_progress = False
+        self._generate_progress_dialog: GenerateProgressDialog | None = None
+        self._generate_email_start: date | None = None
+        self._generate_email_end: date | None = None
 
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
@@ -912,6 +1241,10 @@ class TimeTrackerApp(ctk.CTk):
             self.clear_button.configure(text=self._t("clear"))
         if hasattr(self, "add_project_button"):
             self.add_project_button.configure(text=self._t("add_project"))
+        if hasattr(self, "generate_from_emails_button"):
+            self.generate_from_emails_button.configure(
+                text=self._t("generate_from_emails")
+            )
         if hasattr(self, "edit_list_button"):
             self.edit_list_button.configure(text=self._t("edit_list"))
         if hasattr(self, "done_editing_button"):
@@ -1294,6 +1627,7 @@ class TimeTrackerApp(ctk.CTk):
         self._refresh_todo_edit_controls()
 
     def _refresh_todo_edit_controls(self, *, rebuild_list: bool | None = None) -> None:
+        self.generate_from_emails_button.grid_remove()
         self.edit_list_button.grid_remove()
         self.add_project_button.grid_remove()
         self.done_editing_button.grid_remove()
@@ -1306,7 +1640,15 @@ class TimeTrackerApp(ctk.CTk):
             else:
                 self.done_editing_button.grid(row=0, column=3, padx=(0, 8), sticky="e")
         else:
+            self.generate_from_emails_button.grid(
+                row=0, column=1, padx=(0, 8), sticky="e"
+            )
             self.edit_list_button.grid(row=0, column=2, padx=(0, 8), sticky="e")
+
+        generate_state = (
+            "disabled" if self._generate_in_progress else "normal"
+        )
+        self.generate_from_emails_button.configure(state=generate_state)
 
         if rebuild_list is None:
             rebuild_list = self.tracker_frame.winfo_ismapped()
@@ -1416,6 +1758,120 @@ class TimeTrackerApp(ctk.CTk):
 
     def _on_add_project(self) -> None:
         self._open_project_dialog(None, None)
+
+    def _on_generate_from_emails(self) -> None:
+        if self._generate_in_progress:
+            messagebox.showinfo(self._t("generate_dialog_title"), self._t("generate_busy"))
+            return
+        if not self._confirm_unsaved_todo_if_needed():
+            return
+
+        GenerateTodoDialog(
+            self,
+            self.lang,
+            self.work_date,
+            on_confirm=self._start_email_todo_generation,
+        )
+
+    def _format_email_range(self, start: date, end: date) -> str:
+        if start == end:
+            return format_display_date(start, self.lang)
+        return (
+            f"{format_display_date(start, self.lang)}"
+            f" – {format_display_date(end, self.lang)}"
+        )
+
+    def _start_email_todo_generation(
+        self,
+        todo_lang: str,
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        self._generate_in_progress = True
+        self._generate_email_start = start_date
+        self._generate_email_end = end_date
+        self._refresh_todo_edit_controls(rebuild_list=False)
+        self._generate_progress_dialog = GenerateProgressDialog(self, self.lang)
+
+        step_keys = {
+            "fetch": "generate_step_fetch",
+            "process": "generate_step_process",
+            "generate": "generate_step_generate",
+        }
+
+        def on_progress(step: str) -> None:
+            key = step_keys.get(step, "generate_step_fetch")
+            self.after(0, lambda: self._update_generate_progress(key))
+
+        def worker() -> None:
+            try:
+                from fetch_gmail import generate_todo_from_gmail_date
+
+                result = generate_todo_from_gmail_date(
+                    self.work_date,
+                    lang=todo_lang,
+                    start_date=start_date,
+                    end_date=end_date,
+                    emails_dir=EMAILS_DIR,
+                    on_progress=on_progress,
+                )
+                self.after(0, lambda r=result: self._on_generate_success(r))
+            except Exception as exc:  # noqa: BLE001 — surface any pipeline error in UI
+                self.after(0, lambda e=exc: self._on_generate_failure(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_generate_progress(self, step_key: str) -> None:
+        if self._generate_progress_dialog is not None:
+            self._generate_progress_dialog.set_step(step_key)
+
+    def _close_generate_progress(self) -> None:
+        if self._generate_progress_dialog is not None:
+            self._generate_progress_dialog.destroy()
+            self._generate_progress_dialog = None
+        self._generate_in_progress = False
+        self._refresh_todo_edit_controls(rebuild_list=False)
+
+    def _on_generate_success(self, result: dict) -> None:
+        self._close_generate_progress()
+        generated = projects_from_document(result)
+        if not generated:
+            messagebox.showinfo(
+                self._t("generate_dialog_title"),
+                self._t("generate_empty_todo"),
+            )
+            return
+
+        self.projects, touched = merge_generated_projects(self.projects, generated)
+        for project in self.projects:
+            if project.name not in self.projects_state:
+                self.projects_state[project.name] = default_project_state()
+        if self.selected_index < 0 and self.projects:
+            self.selected_index = 0
+
+        self._mark_dirty()
+        self._set_controls_enabled(bool(self.projects))
+        self._refresh_todo_edit_controls()
+        self._refresh_active_panel()
+        messagebox.showinfo(
+            self._t("generate_dialog_title"),
+            self._t("generate_success", count=touched),
+        )
+
+    def _on_generate_failure(self, exc: BaseException) -> None:
+        self._close_generate_progress()
+        from fetch_gmail import EmptyInboxError
+
+        if isinstance(exc, EmptyInboxError):
+            start = self._generate_email_start or self.work_date
+            end = self._generate_email_end or self.work_date
+            message = self._t(
+                "generate_empty_inbox",
+                range=self._format_email_range(start, end),
+            )
+        else:
+            message = self._t("generate_error_generic", error=str(exc))
+        messagebox.showerror(self._t("generate_error_title"), message)
 
     def _confirm_delete_project(self, project: TodoProject) -> bool:
         seconds = get_elapsed_seconds(
@@ -1598,6 +2054,20 @@ class TimeTrackerApp(ctk.CTk):
             anchor="w",
         )
         self.unsaved_label.grid(row=0, column=0, sticky="w")
+
+        self.generate_from_emails_button = ctk.CTkButton(
+            footer,
+            text="",
+            width=140,
+            height=40,
+            fg_color=WHITE,
+            text_color=NAVY,
+            hover_color=SELECTED_BG,
+            border_width=1,
+            border_color=NAVY,
+            font=ctk.CTkFont(size=14),
+            command=self._on_generate_from_emails,
+        )
 
         self.off_work_button = ctk.CTkButton(
             footer,
@@ -2082,6 +2552,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    load_dotenv()
     args = build_parser().parse_args()
     if args.backfill_descriptions:
         updated = backfill_all_log_descriptions()

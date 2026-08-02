@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import socket
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -52,13 +53,31 @@ EMAIL_SUMMARY_INSTRUCTIONS = (
     "这是一个邮件，根据邮件内容提炼一句话的摘要，并注明是否有附件。"
 )
 
-TODO_LIST_GENERATOR_PROMPT = (
-    "根据邮件内容生成一个 to do list，按项目名称分组，列出需要处理的事项。"
-    "只输出 JSON，不要输出其他解释性文字。格式如下：\n"
-    '{"projects": [{"name": "项目名称", "items": [{"text": "需要处理的事项", "done": false}]}]}'
-)
+TODO_LIST_GENERATOR_PROMPTS = {
+    "cn": (
+        "根据邮件内容生成一个 to do list，按项目名称分组，列出需要处理的事项。"
+        "项目名称与待办事项请使用中文。"
+        "只输出 JSON，不要输出其他解释性文字。格式如下：\n"
+        '{"projects": [{"name": "项目名称", "items": [{"text": "需要处理的事项", "done": false}]}]}'
+    ),
+    "en": (
+        "Based on the emails below, generate a to-do list grouped by project name. "
+        "Use English for project names and to-do item texts. "
+        "Output JSON only, with no other explanatory text. Format:\n"
+        '{"projects": [{"name": "Project name", "items": [{"text": "Action item", "done": false}]}]}'
+    ),
+}
 
-EXCLUDED_TODO_CATEGORIES = {"其他"}
+# Backward-compatible alias for existing callers / docs.
+TODO_LIST_GENERATOR_PROMPT = TODO_LIST_GENERATOR_PROMPTS["cn"]
+
+EXCLUDED_TODO_CATEGORIES = {"其他", "Other", "other"}
+
+
+def normalize_todo_lang(lang: str | None) -> str:
+    if lang and lang.lower() in TODO_LIST_GENERATOR_PROMPTS:
+        return lang.lower()
+    return "cn"
 
 
 def parse_date(value: str) -> date:
@@ -138,6 +157,8 @@ def build_query(start_date: date, end_date: date) -> str:
 
 
 def get_gmail_service(credentials_path: Path, token_path: Path):
+    from google.auth.exceptions import RefreshError
+
     proxy_url = configure_gmail_proxy()
     creds = None
     if token_path.exists():
@@ -145,8 +166,16 @@ def get_gmail_service(credentials_path: Path, token_path: Path):
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                print(
+                    "Saved Gmail token is invalid or revoked. "
+                    "Opening browser to re-authorize..."
+                )
+                creds = None
+
+        if not creds or not creds.valid:
             if not credentials_path.exists():
                 raise FileNotFoundError(
                     f"Missing OAuth credentials at {credentials_path}. "
@@ -392,8 +421,22 @@ def parse_todo_response(raw: str) -> dict:
     return data
 
 
-def build_todo_prompt(emails: list[dict]) -> str:
+def build_todo_prompt(emails: list[dict], lang: str = "cn") -> str:
+    lang = normalize_todo_lang(lang)
+    instruction = TODO_LIST_GENERATOR_PROMPTS[lang]
     lines = []
+    if lang == "en":
+        for index, email in enumerate(emails, start=1):
+            lines.append(
+                f"{index}. Project: {email.get('category')}\n"
+                f"   Subject: {email.get('subject')}\n"
+                f"   From: {email.get('from')}\n"
+                f"   Date: {email.get('date')}\n"
+                f"   Body:\n{get_email_body(email)}"
+            )
+        email_block = "\n\n".join(lines)
+        return f"{instruction}\n\nEmail list:\n{email_block}"
+
     for index, email in enumerate(emails, start=1):
         lines.append(
             f"{index}. 项目: {email.get('category')}\n"
@@ -403,15 +446,17 @@ def build_todo_prompt(emails: list[dict]) -> str:
             f"   正文:\n{get_email_body(email)}"
         )
     email_block = "\n\n".join(lines)
-    return f"{TODO_LIST_GENERATOR_PROMPT}\n\n邮件列表：\n{email_block}"
+    return f"{instruction}\n\n邮件列表：\n{email_block}"
 
 
 def generate_todo_from_json(
     input_path: Path,
     output_path: Path | None = None,
     model_name: str = DOUBAO_PRO_MODEL,
+    lang: str = "cn",
 ) -> dict:
     load_dotenv()
+    lang = normalize_todo_lang(lang)
     data = load_emails_json(input_path)
     emails = data["emails"]
 
@@ -444,7 +489,7 @@ def generate_todo_from_json(
     ]
     skipped = len(emails) - len(actionable)
     if skipped:
-        print(f"Skipped {skipped} email(s) in category 其他")
+        print(f"Skipped {skipped} email(s) in excluded categories")
 
     if not actionable:
         print("No actionable emails to include in todo list.")
@@ -452,6 +497,7 @@ def generate_todo_from_json(
             "source": str(input_path),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "model": model_name,
+            "lang": lang,
             "projects": [],
         }
         out_path = output_path or default_todo_output_path(input_path)
@@ -462,8 +508,8 @@ def generate_todo_from_json(
         print(f"Saved todo list to {out_path}")
         return result
 
-    print(f"Generating todo list from {len(actionable)} email(s)...")
-    prompt = build_todo_prompt(actionable)
+    print(f"Generating todo list ({lang}) from {len(actionable)} email(s)...")
+    prompt = build_todo_prompt(actionable, lang=lang)
     raw_todo = get_doubao_response(model_name, prompt)
     todo_data = parse_todo_response(raw_todo)
 
@@ -471,6 +517,7 @@ def generate_todo_from_json(
         "source": str(input_path),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model": model_name,
+        "lang": lang,
         **todo_data,
     }
 
@@ -481,6 +528,86 @@ def generate_todo_from_json(
     )
     print(f"Saved todo list to {out_path}")
     return result
+
+
+class EmptyInboxError(RuntimeError):
+    """Raised when Gmail returns no messages for the requested date."""
+
+
+def generate_todo_from_gmail_date(
+    work_date: date,
+    lang: str = "en",
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    emails_dir: Path | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Fetch → process → todo for a date range; return todo document with projects.
+
+    ``work_date`` is the tracker day receiving the merge. Emails are fetched for
+    ``start_date``..``end_date`` (inclusive), defaulting both to ``work_date``.
+    """
+    load_dotenv()
+    lang = normalize_todo_lang(lang)
+    progress: Callable[[str], None] = on_progress or (lambda _step: None)
+
+    range_start = start_date or work_date
+    range_end = end_date or work_date
+    if range_start > range_end:
+        raise ValueError("start_date must be on or before end_date")
+
+    out_dir = emails_dir or Path(".time_logs") / "emails"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fetch_path = (
+        out_dir
+        / f"emails_{range_start.isoformat()}_{range_end.isoformat()}.json"
+    )
+    processed_path = default_processed_output_path(fetch_path)
+    todo_path = default_todo_output_path(processed_path)
+
+    progress("fetch")
+    credentials_path = Path(
+        os.getenv("GMAIL_CREDENTIALS_PATH", "credentials.json")
+    )
+    token_path = Path(os.getenv("GMAIL_TOKEN_PATH", "token.json"))
+    query = build_query(range_start, range_end)
+    service = get_gmail_service(credentials_path, token_path)
+    message_ids = list_message_ids(service, query)
+    emails = fetch_messages(service, message_ids)
+
+    fetch_result = {
+        "query": query,
+        "start_date": range_start.isoformat(),
+        "end_date": range_end.isoformat(),
+        "count": len(emails),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "emails": emails,
+    }
+    fetch_path.write_text(
+        json.dumps(fetch_result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    if not emails:
+        if range_start == range_end:
+            range_label = range_start.isoformat()
+        else:
+            range_label = f"{range_start.isoformat()}..{range_end.isoformat()}"
+        raise EmptyInboxError(f"No emails found for {range_label}.")
+
+    progress("process")
+    process_emails_from_json(
+        input_path=fetch_path,
+        output_path=processed_path,
+    )
+
+    progress("generate")
+    return generate_todo_from_json(
+        input_path=processed_path,
+        output_path=todo_path,
+        lang=lang,
+    )
 
 
 def summarize_emails_from_json(
@@ -659,6 +786,7 @@ def run_todo(args: argparse.Namespace) -> None:
         input_path=args.input,
         output_path=args.output,
         model_name=args.model,
+        lang=args.lang,
     )
 
 
@@ -788,6 +916,12 @@ def main() -> None:
         "--model",
         default=DOUBAO_PRO_MODEL,
         help=f"Doubao model name (default: {DOUBAO_PRO_MODEL}).",
+    )
+    todo_parser.add_argument(
+        "--lang",
+        choices=["en", "cn"],
+        default="cn",
+        help="Language for generated todo items (default: cn).",
     )
     todo_parser.set_defaults(func=run_todo)
 
